@@ -43,7 +43,22 @@ Recording defaults are tuned for quick test evidence: 480px maximum dimension, 1
 }
 ```
 
-To record outside a sequence, use `android_start_recording`. It accepts `maxSize`, `bitRate`, and `timeLimit`; for example `{"maxSize":480,"bitRate":1500000,"timeLimit":30}`.
+To record outside a sequence, use `android_start_recording`. It accepts `maxSize`, `bitRate`, and `timeLimit`; for example `{"maxSize":480,"bitRate":1500000,"timeLimit":30}`. `android_pause_recording` finalizes the current MP4 segment and `android_resume_recording` starts the next one in the same session. Android's native `screenrecord` has no true pause support, so the session manifest lists each segment instead of pretending they are one continuous video. To create a combined file when `ffmpeg` is installed, pass `mergeTo` to `android_stop_recording`.
+
+For organized evidence across multiple scenarios, call `android_start_test_run` first and pass its id as `record.testRunId`. `android_capture_checkpoint` saves a screenshot, UI XML when available, and logcat; `android_finish_test_run` finalizes the manifest. A sequence may alternatively set `record.testName` to create an implicit run, and `record.capture` to `"before_after"` or `"on_assertion_failure"` for automatic checkpoints.
+
+```json
+// android_start_test_run
+{"name":"checkout-regression"}
+
+// run_sequence, using the returned test-run id
+{
+  "steps":[{"action":"tap","x":540,"y":700},{"action":"assert_element","resourceId":"order_confirmed","timeoutMs":5000}],
+  "record":{"mode":"on_failure","testRunId":"test-run-...","capture":"on_assertion_failure"}
+}
+```
+
+For a manual recording session, call `android_start_recording`, `android_pause_recording`, `android_resume_recording`, then `android_stop_recording`. The final call returns every segment and the manifest; add `mergeTo` when `ffmpeg` is installed and a combined MP4 is needed.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Node.js 18+](https://img.shields.io/badge/Node.js-18%2B-green.svg)](https://nodejs.org)
@@ -134,13 +149,16 @@ Every tool accepts an optional `device` parameter. When omitted, the server reso
 
 `android_list_devices` also auto-connects wireless-debugging peers advertised via mDNS (`adb mdns services`) when the device list is empty — devices on the same network appear without any manual `adb connect`.
 
-## Capabilities — 35 tools
+## Capabilities — 41 tools
 
 ### Test automation
 
 | Tool | Description | Key parameters |
 |---|---|---|
-| `run_sequence` | Run a batched action sequence with selectors, assertions, variables, and optional recording. | `steps`, `variables?`, `record?` |
+| `run_sequence` | Run a batched action sequence with selectors, assertions, variables, optional recording, and checkpoint capture. | `steps`, `variables?`, `record?` |
+| `android_start_test_run` | Create a per-run artifact directory and manifest. | `name?` |
+| `android_capture_checkpoint` | Save screenshot, UI XML, and logcat as test evidence. | `name`, `testRunId?` |
+| `android_finish_test_run` | Mark a test-run manifest passed or failed. | `testRunId`, `status` |
 | `android_save_flow` | Save a named sequence for repeatable testing. | `name`, `steps`, `variables?` |
 | `android_list_flows` | List saved sequences. | — |
 | `android_run_flow` | Run a saved sequence with variable overrides and optional recording. | `name`, `variables?`, `record?` |
@@ -197,8 +215,10 @@ Every tool accepts an optional `device` parameter. When omitted, the server reso
 | Tool | Description | Key parameters |
 |---|---|---|
 | `android_set_orientation` | Force portrait/landscape (disables auto-rotate). | `orientation` |
-| `android_start_recording` | Start lightweight background screen recording (480px, 1.5 Mbps, 30 s defaults; max 180 s). | `timeLimit?`, `maxSize?`, `bitRate?` |
-| `android_stop_recording` | Stop recording, pull the `.mp4` to this computer. | `saveTo?` |
+| `android_start_recording` | Start lightweight background recording session (480px, 1.5 Mbps, 30 s defaults; max 180 s). | `timeLimit?`, `maxSize?`, `bitRate?`, `testRunId?` |
+| `android_pause_recording` | Finalize the current MP4 segment without ending the session. | `device?` |
+| `android_resume_recording` | Start the next MP4 segment in a paused session. | `device?`, recording options |
+| `android_stop_recording` | Stop recording and return every segment plus the session manifest; can opt into `ffmpeg` merging. | `saveTo?`, `mergeTo?` |
 | `android_logcat` | Read recent logs with buffer selection (`main`/`system`/`crash`/`events`/`all`) and substring filter. Great for debugging Flutter/React Native crashes. | `lines?`, `buffer?`, `filter?` |
 
 ### Element selectors
@@ -240,7 +260,7 @@ Prompts you can give an agent once the server is connected:
 - **Screenshots:** `adb exec-out screencap -p`, returned as PNG (inline base64 image or file).
 - **UI hierarchy:** `adb exec-out uiautomator dump /dev/tty`, parsed with `fast-xml-parser`, retried up to 10× when the bridge returns a null root. Elements with no size or no useful text/id are filtered out.
 - **Input:** `adb shell input` (tap/swipe/text/keyevent/draganddrop). ASCII text uses `input text`; non-ASCII text is set with `cmd clipboard set` and pasted with `KEYCODE_PASTE` when supported by the device.
-- **Recording:** `adb shell screenrecord` is spawned in the background at 480px/1.5 Mbps by default. Stop sends `SIGINT` to the on-device process (`killall -2 screenrecord`), waits for the file to finalize, then `adb pull`s it. `run_sequence` can control recording automatically with `record.mode`.
+- **Recording:** `adb shell screenrecord` is spawned in the background at 480px/1.5 Mbps by default. Stop sends `SIGINT` to the on-device process (`killall -2 screenrecord`), waits for the file to finalize, then `adb pull`s it. Pause/resume is implemented as finalized MP4 segments recorded in a session manifest, because Android does not provide native pause/resume. `run_sequence` can control recording and checkpoint capture automatically.
 - **Foreground app detection:** `dumpsys activity activities` (`ResumedActivity`, covering both pre- and post-Android-13 formats) with `dumpsys window` (`mFocusedApp`) as fallback.
 - **Safety rails:** package names validated against `[a-zA-Z0-9_.]`, output paths must be absolute with allowed extensions, URLs restricted to http(s) unless explicitly overridden.
 
@@ -249,7 +269,7 @@ Prompts you can give an agent once the server is connected:
 ```
 src/
 ├── index.ts    entry point — stdio transport
-├── server.ts   MCP server + 26 tool registrations
+├── server.ts   MCP server + 41 tool registrations
 ├── adb.ts      adb discovery/execution, device resolution, WiFi + mDNS connect
 └── ui.ts       uiautomator dump parsing, selector matching, wait-for-element
 ```
@@ -259,6 +279,7 @@ src/
 ```bash
 npm run watch      # rebuild on change
 npm run inspector  # test tools interactively with MCP Inspector
+npm test           # lifecycle regression tests without a connected Android device
 ```
 
 ## Troubleshooting

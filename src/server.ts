@@ -1,13 +1,14 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { ChildProcess } from "node:child_process";
+import { execFileSync } from "node:child_process";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
 import { AdbClient, ActionableError, validatePackageName } from "./adb.js";
 import { UiInspector, ElementSelector, elementCenter } from "./ui.js";
+import { RecordingManager, RecordingOptions, RecordingSession } from "./recording.js";
 
 const SERVER_VERSION = "1.0.0";
 const ALLOWED_SCREENSHOT_EXTENSIONS = [".png"];
@@ -39,16 +40,18 @@ const KEYCODE_ALIASES: Record<string, string> = {
 	DPAD_CENTER: "KEYCODE_DPAD_CENTER",
 };
 
-interface ActiveRecording {
-	process: ChildProcess;
-	devicePath: string;
-	startedAt: number;
-}
+type CaptureMode = "none" | "on_assertion_failure" | "before_after";
 
-interface RecordingOptions {
-	timeLimit?: number;
-	maxSize?: number;
-	bitRate?: number;
+interface TestRun {
+	id: string;
+	name?: string;
+	status: "active" | "passed" | "failed";
+	startedAt: string;
+	endedAt?: string;
+	artifactDirectory: string;
+	manifestPath: string;
+	checkpoints: Array<{ name: string; capturedAt: string; artifacts: Record<string, string> }>;
+	recordingSessions: string[];
 }
 
 const validateFileExtension = (filePath: string, allowed: string[]): void => {
@@ -76,21 +79,24 @@ export const createServer = (): McpServer => {
 
 	const adb = new AdbClient();
 	const ui = new UiInspector(adb);
-	const activeRecordings = new Map<string, ActiveRecording>();
 	const transientDirectory = path.join(os.tmpdir(), "android-mcp-transient");
 	fs.rmSync(transientDirectory, { recursive: true, force: true });
 	fs.mkdirSync(transientDirectory, { recursive: true });
+	const recordings = new RecordingManager(adb, {
+		artifactDirectory: transientDirectory,
+		defaultMaxSize: DEFAULT_RECORDING_MAX_SIZE,
+		defaultBitRate: DEFAULT_RECORDING_BIT_RATE,
+		defaultTimeLimitSeconds: DEFAULT_RECORDING_TIME_LIMIT_SECONDS,
+	});
+	const testRuns = new Map<string, TestRun>();
 	const cleanRuntimeState = (): void => {
-		for (const [deviceId, recording] of activeRecordings) {
-			try { adb.shell(deviceId, "killall", "-2", "screenrecord"); } catch { /* recording may already be stopped */ }
-			recording.process.kill("SIGKILL");
-		}
-		activeRecordings.clear();
+		recordings.stopAll();
+		testRuns.clear();
 		fs.rmSync(transientDirectory, { recursive: true, force: true });
 		fs.mkdirSync(transientDirectory, { recursive: true });
 	};
 	process.once("exit", () => {
-		for (const recording of activeRecordings.values()) recording.process.kill("SIGKILL");
+		recordings.stopAll();
 		fs.rmSync(transientDirectory, { recursive: true, force: true });
 	});
 
@@ -205,29 +211,24 @@ export const createServer = (): McpServer => {
 			await new Promise(resolve => setTimeout(resolve, 1000));
 		}
 	};
-	const saveFailureScreenshot = (id: string): string | undefined => {
-		try {
-			const outputPath = path.join(transientDirectory, `sequence-failure-${Date.now()}.png`);
-			fs.writeFileSync(outputPath, adb.adb(id, "exec-out", "screencap", "-p"));
-			return outputPath;
-		} catch {
-			return undefined;
-		}
-	};
-	const saveFailureArtifacts = (id: string): Record<string, string> => {
+	const captureArtifacts = (id: string, directory: string, prefix: string): Record<string, string> => {
+		fs.mkdirSync(directory, { recursive: true });
 		const stamp = Date.now();
 		const artifacts: Record<string, string> = {};
-		const screenshotPath = saveFailureScreenshot(id);
-		if (screenshotPath) artifacts.screenshot = screenshotPath;
 		try {
-			const uiPath = path.join(transientDirectory, `sequence-failure-${stamp}.xml`);
+			const screenshotPath = path.join(directory, `${prefix}-${stamp}.png`);
+			fs.writeFileSync(screenshotPath, adb.adb(id, "exec-out", "screencap", "-p"));
+			artifacts.screenshot = screenshotPath;
+		} catch { /* capture should not hide the original failure */ }
+		try {
+			const uiPath = path.join(directory, `${prefix}-${stamp}.xml`);
 			fs.writeFileSync(uiPath, adb.adb(id, "exec-out", "uiautomator", "dump", "/dev/tty"));
 			artifacts.uiHierarchy = uiPath;
 		} catch {
 			// Some secure screens do not expose an accessibility hierarchy.
 		}
 		try {
-			const logPath = path.join(transientDirectory, `sequence-failure-${stamp}.log`);
+			const logPath = path.join(directory, `${prefix}-${stamp}.log`);
 			fs.writeFileSync(logPath, adb.adb(id, "logcat", "-d", "-t", "200"));
 			artifacts.logcat = logPath;
 		} catch {
@@ -235,80 +236,56 @@ export const createServer = (): McpServer => {
 		}
 		return artifacts;
 	};
-	const startRecording = (id: string, options: RecordingOptions = {}): ActiveRecording => {
-		if (activeRecordings.has(id)) {
-			throw new ActionableError(`Device "${id}" is already being recorded. Stop it first with android_stop_recording.`);
+	const writeTestRun = (run: TestRun): void => fs.writeFileSync(run.manifestPath, JSON.stringify(run, null, 2), "utf8");
+	const createTestRun = (name?: string): TestRun => {
+		const id = `test-run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+		const artifactDirectory = path.join(transientDirectory, "test-runs", id);
+		fs.mkdirSync(artifactDirectory, { recursive: true });
+		const run: TestRun = { id, name, status: "active", startedAt: new Date().toISOString(), artifactDirectory, manifestPath: path.join(artifactDirectory, "manifest.json"), checkpoints: [], recordingSessions: [] };
+		testRuns.set(id, run);
+		writeTestRun(run);
+		return run;
+	};
+	const resolveTestRun = (testRunId?: string, testName?: string): TestRun | undefined => {
+		if (!testRunId && !testName) return undefined;
+		if (testRunId) {
+			const run = testRuns.get(testRunId);
+			if (!run) throw new ActionableError(`Test run "${testRunId}" was not found. Start one with android_start_test_run.`);
+			return run;
 		}
-		const devicePath = `/sdcard/android-mcp-recording-${Date.now()}.mp4`;
-		const args = ["shell", "screenrecord"];
-		const maxSize = options.maxSize ?? DEFAULT_RECORDING_MAX_SIZE;
-		const size = adb.getScreenSize(id);
-		const scale = Math.min(1, maxSize / Math.max(size.width, size.height));
-		const width = Math.max(2, Math.floor(size.width * scale / 2) * 2);
-		const height = Math.max(2, Math.floor(size.height * scale / 2) * 2);
-		args.push("--size", `${width}x${height}`);
-		args.push("--bit-rate", `${options.bitRate ?? DEFAULT_RECORDING_BIT_RATE}`);
-		args.push("--time-limit", `${options.timeLimit ?? DEFAULT_RECORDING_TIME_LIMIT_SECONDS}`);
-		args.push(devicePath);
-
-		const recording: ActiveRecording = { process: adb.spawnAdb(id, ...args), devicePath, startedAt: Date.now() };
-		activeRecordings.set(id, recording);
-		const forgetRecordingOnStartFailure = () => {
-			if (activeRecordings.get(id) === recording) activeRecordings.delete(id);
-		};
-		// Keep the entry after a time-limit exit: android_stop_recording still
-		// needs the device path to pull the finalized video.
-		recording.process.once("error", forgetRecordingOnStartFailure);
+		return createTestRun(testName);
+	};
+	const saveCheckpoint = (id: string, name: string, run?: TestRun): Record<string, string> => {
+		const artifacts = captureArtifacts(id, run?.artifactDirectory ?? transientDirectory, `checkpoint-${name.replace(/[^a-zA-Z0-9_-]/g, "-")}`);
+		if (run) {
+			run.checkpoints.push({ name, capturedAt: new Date().toISOString(), artifacts });
+			writeTestRun(run);
+		}
+		return artifacts;
+	};
+	const startRecording = (id: string, options: RecordingOptions = {}, run?: TestRun): RecordingSession => {
+		const recording = recordings.start(id, options, run?.artifactDirectory);
+		if (run) { run.recordingSessions.push(recording.id); writeTestRun(run); }
 		return recording;
 	};
-	const waitForRecordingToFinish = async (recording: ActiveRecording): Promise<void> => {
-		await new Promise<void>(resolve => {
-			const timer = setTimeout(() => {
-				recording.process.kill("SIGKILL");
-				resolve();
-			}, 10000);
-			if (recording.process.exitCode !== null) {
-				clearTimeout(timer);
-				resolve();
-				return;
-			}
-			recording.process.once("close", () => {
-				clearTimeout(timer);
-				resolve();
-			});
-		});
-	};
-	const stopRecording = async (id: string, saveTo?: string): Promise<{ outputPath: string; durationSeconds: number; sizeMB: string }> => {
-		const recording = activeRecordings.get(id);
-		if (!recording) throw new ActionableError(`No active recording for device "${id}". Start one with android_start_recording.`);
-		activeRecordings.delete(id);
-		const outputPath = saveTo ?? path.join(os.tmpdir(), `android-recording-${Date.now()}.mp4`);
-		if (saveTo) {
-			validateFileExtension(saveTo, ALLOWED_RECORDING_EXTENSIONS);
-			validateOutputPath(saveTo);
-		}
-		try { adb.shell(id, "killall", "-2", "screenrecord"); } catch { /* already stopped */ }
-		await waitForRecordingToFinish(recording);
-		await new Promise(resolve => setTimeout(resolve, 1000));
+	const stopRecording = async (id: string, saveTo?: string): Promise<RecordingSession> => recordings.stop(id, saveTo);
+	const mergeRecordingSegments = (recording: RecordingSession, mergeTo: string): string => {
+		if (recording.segments.length < 2) throw new ActionableError("At least two recording segments are required to merge a recording session.");
+		validateFileExtension(mergeTo, ALLOWED_RECORDING_EXTENSIONS);
+		validateOutputPath(mergeTo);
+		const sources = recording.segments.map(segment => segment.outputPath).filter((value): value is string => value !== undefined);
+		if (sources.length !== recording.segments.length) throw new ActionableError("Cannot merge: one or more recording segments were not pulled successfully.");
+		const concatPath = path.join(recording.artifactDirectory, "ffmpeg-concat.txt");
+		fs.writeFileSync(concatPath, sources.map(source => `file '${source.replace(/'/g, "'\\\\''")}'`).join("\n"), "utf8");
 		try {
-			adb.adb(id, "pull", recording.devicePath, outputPath);
+			execFileSync("ffmpeg", ["-y", "-f", "concat", "-safe", "0", "-i", concatPath, "-c", "copy", mergeTo], { stdio: "pipe" });
 		} catch (error: any) {
-			throw new ActionableError(`Failed to pull recording from device: ${error.message}. The file may still be at ${recording.devicePath} on the device.`);
+			if (error.code === "ENOENT") throw new ActionableError("ffmpeg is not installed or not on PATH. Use the segment paths in the recording manifest instead.");
+			throw new ActionableError(`ffmpeg could not merge the recording segments: ${error.stderr?.toString().trim() || error.message}`);
 		}
-		try { adb.shell(id, "rm", recording.devicePath); } catch { /* non-fatal */ }
-		return {
-			outputPath,
-			durationSeconds: Math.round((Date.now() - recording.startedAt) / 1000),
-			sizeMB: (fs.statSync(outputPath).size / (1024 * 1024)).toFixed(2),
-		};
-	};
-	const discardRecording = async (id: string): Promise<void> => {
-		const recording = activeRecordings.get(id);
-		if (!recording) return;
-		activeRecordings.delete(id);
-		try { adb.shell(id, "killall", "-2", "screenrecord"); } catch { /* already stopped */ }
-		await waitForRecordingToFinish(recording);
-		try { adb.shell(id, "rm", recording.devicePath); } catch { /* non-fatal */ }
+		recording.mergedPath = mergeTo;
+		fs.writeFileSync(recording.manifestPath, JSON.stringify(recording, null, 2), "utf8");
+		return mergeTo;
 	};
 	const interpolate = (value: string, variables: Record<string, string>): string =>
 		value.replace(/\{\{([a-zA-Z_][a-zA-Z0-9_]*)\}\}/g, (_, name: string) => {
@@ -357,7 +334,7 @@ export const createServer = (): McpServer => {
 		device: string | undefined,
 		variables: Record<string, string> | undefined,
 		steps: any[],
-		record?: RecordingOptions & { mode: "always" | "on_failure" }
+		record?: RecordingOptions & { mode: "always" | "on_failure"; testRunId?: string; testName?: string; capture?: CaptureMode }
 	): Promise<string> => {
 			const sequenceVariables = variables ?? {};
 			for (const s of steps) {
@@ -365,7 +342,10 @@ export const createServer = (): McpServer => {
 				if (s.action === "assert_app") validatePackageName(interpolate(s.packageName, sequenceVariables));
 			}
 			const id = adb.resolveDevice(device);
-			if (record) startRecording(id, record);
+			const testRun = resolveTestRun(record?.testRunId, record?.testName);
+			const ownsTestRun = Boolean(record?.testName && !record?.testRunId);
+			if (record) startRecording(id, record, testRun);
+			if (record?.capture === "before_after") saveCheckpoint(id, "before", testRun);
 			try {
 			let commands: string[] = [];
 			let batchStart = 0;
@@ -429,17 +409,29 @@ export const createServer = (): McpServer => {
 			if (record?.mode === "always") {
 				result.recording = await stopRecording(id);
 			} else if (record?.mode === "on_failure") {
-				await discardRecording(id);
+				await recordings.discard(id);
+			}
+			if (record?.capture === "before_after") result.afterCheckpoint = saveCheckpoint(id, "after", testRun);
+			if (testRun) {
+				if (ownsTestRun) { testRun.status = "passed"; testRun.endedAt = new Date().toISOString(); writeTestRun(testRun); }
+				result.testRun = { id: testRun.id, manifestPath: testRun.manifestPath };
 			}
 			return JSON.stringify(result);
 			} catch (error: any) {
-				const artifacts = saveFailureArtifacts(id);
-				if (record && activeRecordings.has(id)) {
+				const artifacts = captureArtifacts(id, testRun?.artifactDirectory ?? transientDirectory, "sequence-failure");
+				if (record?.capture === "before_after" || (record?.capture === "on_assertion_failure" && error.message.includes("Sequence assertion failed"))) saveCheckpoint(id, "failure", testRun);
+				if (record && recordings.has(id)) {
 					try {
-						artifacts.recording = (await stopRecording(id)).outputPath;
+						const recording = await stopRecording(id);
+						artifacts.recordingManifest = recording.manifestPath;
+						if (recording.segments.at(-1)?.outputPath) artifacts.recording = recording.segments.at(-1)!.outputPath!;
 					} catch (recordingError: any) {
 						artifacts.recordingError = recordingError.message;
 					}
+				}
+				if (testRun) {
+					if (ownsTestRun) { testRun.status = "failed"; testRun.endedAt = new Date().toISOString(); writeTestRun(testRun); }
+					artifacts.testRunManifest = testRun.manifestPath;
 				}
 				throw new Error(`${error.message} Failure artifacts: ${JSON.stringify(artifacts)}`);
 			}
@@ -447,6 +439,9 @@ export const createServer = (): McpServer => {
 
 	const recordingParams = {
 		mode: z.enum(["always", "on_failure"]).describe("always keeps a video for every run; on_failure keeps it only when the sequence fails."),
+		testRunId: z.string().optional().describe("Optional test run created by android_start_test_run. Artifacts are stored in its manifest directory."),
+		testName: z.string().min(1).max(120).optional().describe("Creates an implicit test run when testRunId is omitted."),
+		capture: z.enum(["none", "on_assertion_failure", "before_after"]).optional().describe("Capture checkpoints around the sequence or when it fails."),
 		timeLimit: z.coerce.number().int().min(1).max(MAX_RECORDING_SECONDS).optional().describe(`Auto-stop after this many seconds. Defaults to ${DEFAULT_RECORDING_TIME_LIMIT_SECONDS}.`),
 		maxSize: z.number().int().min(16).max(4096).optional().describe(`Maximum video dimension. Defaults to ${DEFAULT_RECORDING_MAX_SIZE}px.`),
 		bitRate: z.number().int().min(100_000).max(100_000_000).optional().describe(`Video bitrate in bits per second. Defaults to ${DEFAULT_RECORDING_BIT_RATE}.`),
@@ -455,6 +450,46 @@ export const createServer = (): McpServer => {
 	tool("run_sequence", "Run Android Sequence", "Run ordered Android actions, batching consecutive input commands in one ADB shell. Optionally capture lightweight 480p evidence; failed runs save video, screenshot, UI XML, and logcat.",
 		{ device: deviceParam, variables: z.record(z.string()).optional().describe("Reusable string values referenced as {{name}} in text, selectors, and assert_app."), steps: z.array(step).min(1).max(100), record: z.object(recordingParams).optional() }, {},
 		async ({ device, variables, steps, record }) => runSequence(device, variables, steps, record)
+	);
+
+	tool(
+		"android_start_test_run",
+		"Start Test Run",
+		"Create an artifact directory and manifest for a named test run. Use its id with run_sequence, checkpoints, and recordings.",
+		{ name: z.string().min(1).max(120).optional() },
+		{},
+		async ({ name }) => {
+			const run = createTestRun(name);
+			return JSON.stringify({ id: run.id, artifactDirectory: run.artifactDirectory, manifestPath: run.manifestPath }, null, 2);
+		}
+	);
+
+	tool(
+		"android_capture_checkpoint",
+		"Capture Test Checkpoint",
+		"Capture a screenshot, UI hierarchy, and logcat for a test checkpoint; stores it in the test-run manifest when provided.",
+		{ device: deviceParam, name: z.string().min(1).max(120), testRunId: z.string().optional() },
+		{ readOnlyHint: true },
+		async ({ device, name, testRunId }) => {
+			const id = adb.resolveDevice(device);
+			const run = testRunId ? resolveTestRun(testRunId) : undefined;
+			return JSON.stringify({ device: id, name, artifacts: saveCheckpoint(id, name, run), manifestPath: run?.manifestPath }, null, 2);
+		}
+	);
+
+	tool(
+		"android_finish_test_run",
+		"Finish Test Run",
+		"Finalize a test-run manifest after all scenarios have completed.",
+		{ testRunId: z.string(), status: z.enum(["passed", "failed"]) },
+		{},
+		async ({ testRunId, status }) => {
+			const run = resolveTestRun(testRunId)!;
+			run.status = status;
+			run.endedAt = new Date().toISOString();
+			writeTestRun(run);
+			return JSON.stringify({ id: run.id, status: run.status, manifestPath: run.manifestPath }, null, 2);
+		}
 	);
 
 	tool(
@@ -521,7 +556,7 @@ export const createServer = (): McpServer => {
 		{ destructiveHint: true },
 		async ({ confirm }) => {
 			const flowCount = readFlows().length;
-			const recordingCount = activeRecordings.size;
+			const recordingCount = recordings.count;
 			if (!confirm) return `Dry run: set confirm: true to permanently delete ${flowCount} saved flow(s), stop ${recordingCount} active recording(s), and clear temporary MCP artifacts.`;
 			try {
 				fs.rmSync(flowFilePath, { force: true });
@@ -1144,34 +1179,67 @@ export const createServer = (): McpServer => {
 	tool(
 		"android_start_recording",
 		"Start Screen Recording",
-		"Start a lightweight 480p screen recording in the background. Stop it with android_stop_recording. Max duration is 180 seconds (Android limit).",
+		"Start a lightweight 480p recording session in the background. Pause finalizes the current MP4 segment; resume starts another segment in the same manifest.",
 		{
 			device: deviceParam,
+			testRunId: z.string().optional().describe("Optional test run that owns this recording session and its artifacts."),
 			timeLimit: recordingParams.timeLimit,
 			maxSize: recordingParams.maxSize,
 			bitRate: recordingParams.bitRate,
 		},
 		{},
+		async ({ device, testRunId, timeLimit, maxSize, bitRate }) => {
+			const id = adb.resolveDevice(device);
+			const recording = startRecording(id, { timeLimit, maxSize, bitRate }, testRunId ? resolveTestRun(testRunId) : undefined);
+			return JSON.stringify({ message: `Screen recording started on ${id}.`, sessionId: recording.id, manifestPath: recording.manifestPath }, null, 2);
+		}
+	);
+
+	tool(
+		"android_pause_recording",
+		"Pause Screen Recording",
+		"Finalize and pull the current MP4 segment while preserving the recording session. Android screenrecord has no native pause support.",
+		{ device: deviceParam },
+		{},
+		async ({ device }) => {
+			const id = adb.resolveDevice(device);
+			const recording = await recordings.pause(id);
+			return JSON.stringify({ sessionId: recording.id, status: recording.status, segment: recording.segments.at(-1), manifestPath: recording.manifestPath }, null, 2);
+		}
+	);
+
+	tool(
+		"android_resume_recording",
+		"Resume Screen Recording",
+		"Start the next MP4 segment in a paused recording session. Segments are listed in the session manifest.",
+		{ device: deviceParam, timeLimit: recordingParams.timeLimit, maxSize: recordingParams.maxSize, bitRate: recordingParams.bitRate },
+		{},
 		async ({ device, timeLimit, maxSize, bitRate }) => {
 			const id = adb.resolveDevice(device);
-			startRecording(id, { timeLimit, maxSize, bitRate });
-			return `Screen recording started on ${id} (${maxSize ?? DEFAULT_RECORDING_MAX_SIZE}px max, ${bitRate ?? DEFAULT_RECORDING_BIT_RATE} bps). Use android_stop_recording to stop and save it.`;
+			const recording = recordings.resume(id, { timeLimit, maxSize, bitRate });
+			return JSON.stringify({ sessionId: recording.id, status: recording.status, nextSegment: recording.segments.at(-1), manifestPath: recording.manifestPath }, null, 2);
 		}
 	);
 
 	tool(
 		"android_stop_recording",
 		"Stop Screen Recording",
-		"Stop the active screen recording, pull the video from the device, and save it as an .mp4 file on this computer.",
+		"Stop the recording session and pull its final MP4 segment. Paused/resumed sessions retain every segment in the manifest; use mergeTo to combine them with ffmpeg when available.",
 		{
 			device: deviceParam,
 			saveTo: z.string().optional().describe("Absolute path to save the .mp4 to. Defaults to a temporary file."),
+			mergeTo: z.string().optional().describe("Optional absolute .mp4 output for merging two or more paused/resumed segments with ffmpeg, when available."),
 		},
 		{},
-		async ({ device, saveTo }) => {
+		async ({ device, saveTo, mergeTo }) => {
 			const id = adb.resolveDevice(device);
+			if (saveTo) {
+				validateFileExtension(saveTo, ALLOWED_RECORDING_EXTENSIONS);
+				validateOutputPath(saveTo);
+			}
 			const recording = await stopRecording(id, saveTo);
-			return `Recording saved to ${recording.outputPath} (${recording.sizeMB} MB, ~${recording.durationSeconds}s)`;
+			const mergedPath = mergeTo ? mergeRecordingSegments(recording, mergeTo) : undefined;
+			return JSON.stringify({ sessionId: recording.id, segments: recording.segments, manifestPath: recording.manifestPath, mergedPath }, null, 2);
 		}
 	);
 

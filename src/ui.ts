@@ -16,6 +16,8 @@ export interface ScreenElement {
 	identifier?: string;
 	focused?: boolean;
 	clickable?: boolean;
+	enabled?: boolean;
+	checked?: boolean;
 	rect: ElementRect;
 }
 
@@ -24,7 +26,15 @@ export interface ElementSelector {
 	textContains?: string;
 	resourceId?: string;
 	contentDesc?: string;
+	contentDescExact?: string;
 	className?: string;
+	textRegex?: string;
+	clickable?: boolean;
+	enabled?: boolean;
+	focused?: boolean;
+	checked?: boolean;
+	nearText?: string;
+	maxDistance?: number;
 }
 
 interface UiNode {
@@ -35,7 +45,9 @@ interface UiNode {
 	hint?: string;
 	focused?: string;
 	clickable?: string;
+	enabled?: string;
 	checkable?: string;
+	checked?: string;
 	"content-desc"?: string;
 	"resource-id"?: string;
 }
@@ -58,7 +70,7 @@ const collectElements = (node: UiNode, out: ScreenElement[]): void => {
 	}
 
 	const interesting =
-		node.text || node["content-desc"] || node.hint || node["resource-id"] || node.checkable === "true";
+		node.text || node["content-desc"] || node.hint || node["resource-id"] || node.checkable === "true" || node.clickable === "true";
 	if (!interesting) {
 		return;
 	}
@@ -88,6 +100,12 @@ const collectElements = (node: UiNode, out: ScreenElement[]): void => {
 	}
 	if (node.clickable === "true") {
 		element.clickable = true;
+	}
+	if (node.enabled === "true") {
+		element.enabled = true;
+	}
+	if (node.checked === "true") {
+		element.checked = true;
 	}
 
 	out.push(element);
@@ -145,14 +163,23 @@ export class UiInspector {
 	}
 
 	public hasAnySelector(selector: ElementSelector): boolean {
-		return Boolean(
-			selector.text || selector.textContains || selector.resourceId || selector.contentDesc || selector.className
-		);
+		return Object.entries(selector).some(([key, value]) => key !== "maxDistance" && value !== undefined && value !== "");
 	}
 
 	public findElements(deviceId: string, selector: ElementSelector): ScreenElement[] {
 		const resolvedId = selector.resourceId ? this.resolveResourceId(deviceId, selector.resourceId) : undefined;
+		let textPattern: RegExp | undefined;
+		if (selector.textRegex !== undefined) {
+			try {
+				textPattern = new RegExp(selector.textRegex);
+			} catch {
+				throw new ActionableError(`Invalid textRegex: ${selector.textRegex}`);
+			}
+		}
 		const elements = this.getElements(deviceId);
+		const nearTargets = selector.nearText === undefined
+			? []
+			: elements.filter(el => el.text?.toLowerCase().includes(selector.nearText!.toLowerCase()));
 
 		return elements.filter(el => {
 			if (selector.text !== undefined && el.text !== selector.text) {
@@ -162,6 +189,9 @@ export class UiInspector {
 				if (!el.text || !el.text.toLowerCase().includes(selector.textContains.toLowerCase())) {
 					return false;
 				}
+			}
+			if (textPattern !== undefined && (!el.text || !textPattern.test(el.text))) {
+				return false;
 			}
 			if (resolvedId !== undefined) {
 				const matchesFull = el.identifier === resolvedId;
@@ -175,10 +205,35 @@ export class UiInspector {
 					return false;
 				}
 			}
+			if (selector.contentDescExact !== undefined && el.label !== selector.contentDescExact) {
+				return false;
+			}
 			if (selector.className !== undefined) {
 				if (el.type !== selector.className && !el.type.endsWith(`.${selector.className}`)) {
 					return false;
 				}
+			}
+			if (selector.clickable !== undefined && Boolean(el.clickable) !== selector.clickable) {
+				return false;
+			}
+			if (selector.enabled !== undefined && Boolean(el.enabled) !== selector.enabled) {
+				return false;
+			}
+			if (selector.focused !== undefined && Boolean(el.focused) !== selector.focused) {
+				return false;
+			}
+			if (selector.checked !== undefined && Boolean(el.checked) !== selector.checked) {
+				return false;
+			}
+			if (selector.nearText !== undefined) {
+				const maxDistance = selector.maxDistance ?? 200;
+				const center = elementCenter(el);
+				const isNear = nearTargets.some(target => {
+					if (target === el) return false;
+					const targetCenter = elementCenter(target);
+					return Math.hypot(center.x - targetCenter.x, center.y - targetCenter.y) <= maxDistance;
+				});
+				if (!isNear) return false;
 			}
 			return true;
 		});
@@ -198,6 +253,19 @@ export class UiInspector {
 			}
 			if (Date.now() >= deadline) {
 				return null;
+			}
+			await new Promise(resolve => setTimeout(resolve, 1000));
+		}
+	}
+
+	public async waitForNoElement(deviceId: string, selector: ElementSelector, timeoutMs: number): Promise<boolean> {
+		const deadline = Date.now() + timeoutMs;
+		for (;;) {
+			if (this.findElements(deviceId, selector).length === 0) {
+				return true;
+			}
+			if (Date.now() >= deadline) {
+				return false;
 			}
 			await new Promise(resolve => setTimeout(resolve, 1000));
 		}

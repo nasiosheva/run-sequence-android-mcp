@@ -13,6 +13,9 @@ const SERVER_VERSION = "1.0.0";
 const ALLOWED_SCREENSHOT_EXTENSIONS = [".png"];
 const ALLOWED_RECORDING_EXTENSIONS = [".mp4"];
 const MAX_RECORDING_SECONDS = 180; // hard limit of android screenrecord
+const DEFAULT_RECORDING_TIME_LIMIT_SECONDS = 30;
+const DEFAULT_RECORDING_MAX_SIZE = 480;
+const DEFAULT_RECORDING_BIT_RATE = 1_500_000;
 
 const KEYCODE_ALIASES: Record<string, string> = {
 	BACK: "KEYCODE_BACK",
@@ -42,6 +45,12 @@ interface ActiveRecording {
 	startedAt: number;
 }
 
+interface RecordingOptions {
+	timeLimit?: number;
+	maxSize?: number;
+	bitRate?: number;
+}
+
 const validateFileExtension = (filePath: string, allowed: string[]): void => {
 	const ext = path.extname(filePath).toLowerCase();
 	if (!allowed.includes(ext)) {
@@ -68,6 +77,22 @@ export const createServer = (): McpServer => {
 	const adb = new AdbClient();
 	const ui = new UiInspector(adb);
 	const activeRecordings = new Map<string, ActiveRecording>();
+	const transientDirectory = path.join(os.tmpdir(), "android-mcp-transient");
+	fs.rmSync(transientDirectory, { recursive: true, force: true });
+	fs.mkdirSync(transientDirectory, { recursive: true });
+	const cleanRuntimeState = (): void => {
+		for (const [deviceId, recording] of activeRecordings) {
+			try { adb.shell(deviceId, "killall", "-2", "screenrecord"); } catch { /* recording may already be stopped */ }
+			recording.process.kill("SIGKILL");
+		}
+		activeRecordings.clear();
+		fs.rmSync(transientDirectory, { recursive: true, force: true });
+		fs.mkdirSync(transientDirectory, { recursive: true });
+	};
+	process.once("exit", () => {
+		for (const recording of activeRecordings.values()) recording.process.kill("SIGKILL");
+		fs.rmSync(transientDirectory, { recursive: true, force: true });
+	});
 
 	type ZodShape = Record<string, z.ZodType>;
 
@@ -117,23 +142,45 @@ export const createServer = (): McpServer => {
 	const selectorParams: ZodShape = {
 		text: z.string().optional().describe("Match by exact visible text"),
 		textContains: z.string().optional().describe("Match by substring of visible text (case-insensitive)"),
+		textRegex: z.string().optional().describe("Match visible text with a JavaScript regular expression"),
 		resourceId: z
 			.string()
 			.optional()
 			.describe("Match by resource id. Short ids like 'btn_login' are auto-expanded using the foreground app package"),
 		contentDesc: z.string().optional().describe("Match by accessibility label / content description (substring, case-insensitive)"),
+		contentDescExact: z.string().optional().describe("Match an accessibility label / content description exactly"),
 		className: z.string().optional().describe("Match by class name, e.g. 'android.widget.Button' or just 'Button'"),
+		clickable: z.boolean().optional().describe("Match the element clickable state"),
+		enabled: z.boolean().optional().describe("Match the element enabled state"),
+		focused: z.boolean().optional().describe("Match the element focused state"),
+		checked: z.boolean().optional().describe("Match the element checked state"),
+		nearText: z.string().optional().describe("Match an element near visible text (case-insensitive)"),
+		maxDistance: z.number().int().min(1).max(32767).optional().describe("Maximum distance in pixels for nearText; defaults to 200"),
 	};
 
 	const requireSelector = (selector: ElementSelector): void => {
 		if (!ui.hasAnySelector(selector)) {
 			throw new ActionableError(
-				"At least one selector is required: text, textContains, resourceId, contentDesc, or className."
+				"At least one selector is required. Use text, textContains, textRegex, resourceId, contentDesc, contentDescExact, className, nearText, or an element state."
 			);
 		}
 	};
 
 	const coordinate = z.number().int().min(0).max(32767);
+	const typeText = (id: string, text: string): void => {
+		if (adb.isAscii(text)) {
+			adb.shell(id, "input", "text", adb.escapeShellText(text));
+			return;
+		}
+		try {
+			adb.shell(id, "cmd", "clipboard", "set", adb.escapeShellText(text));
+			adb.shell(id, "input", "keyevent", "KEYCODE_PASTE");
+		} catch (error: any) {
+			throw new ActionableError(
+				`Unicode input requires the Android clipboard shell command. The device rejected it: ${error.message}`
+			);
+		}
+	};
 	const clearField = (id: string): void => {
 		const field = ui.getElements(id).find(el => el.focused && el.type === "android.widget.EditText");
 		if (!field) throw new ActionableError("Cannot clear: no accessible focused text field found.");
@@ -145,22 +192,181 @@ export const createServer = (): McpServer => {
 		const remaining = ui.getElements(id).find(el => el.focused && el.type === "android.widget.EditText");
 		if (remaining?.text && remaining.text !== remaining.label) throw new ActionableError("Could not verify that the focused field is empty.");
 	};
+	const waitForForegroundApp = async (id: string, packageName: string, activity: string | undefined, timeoutMs: number): Promise<boolean> => {
+		const deadline = Date.now() + timeoutMs;
+		for (;;) {
+			const current = adb.getCurrentApp(id);
+			if (current.packageName === packageName && (activity === undefined || current.activity === activity)) {
+				return true;
+			}
+			if (Date.now() >= deadline) {
+				return false;
+			}
+			await new Promise(resolve => setTimeout(resolve, 1000));
+		}
+	};
+	const saveFailureScreenshot = (id: string): string | undefined => {
+		try {
+			const outputPath = path.join(transientDirectory, `sequence-failure-${Date.now()}.png`);
+			fs.writeFileSync(outputPath, adb.adb(id, "exec-out", "screencap", "-p"));
+			return outputPath;
+		} catch {
+			return undefined;
+		}
+	};
+	const saveFailureArtifacts = (id: string): Record<string, string> => {
+		const stamp = Date.now();
+		const artifacts: Record<string, string> = {};
+		const screenshotPath = saveFailureScreenshot(id);
+		if (screenshotPath) artifacts.screenshot = screenshotPath;
+		try {
+			const uiPath = path.join(transientDirectory, `sequence-failure-${stamp}.xml`);
+			fs.writeFileSync(uiPath, adb.adb(id, "exec-out", "uiautomator", "dump", "/dev/tty"));
+			artifacts.uiHierarchy = uiPath;
+		} catch {
+			// Some secure screens do not expose an accessibility hierarchy.
+		}
+		try {
+			const logPath = path.join(transientDirectory, `sequence-failure-${stamp}.log`);
+			fs.writeFileSync(logPath, adb.adb(id, "logcat", "-d", "-t", "200"));
+			artifacts.logcat = logPath;
+		} catch {
+			// Log collection must not hide the original test failure.
+		}
+		return artifacts;
+	};
+	const startRecording = (id: string, options: RecordingOptions = {}): ActiveRecording => {
+		if (activeRecordings.has(id)) {
+			throw new ActionableError(`Device "${id}" is already being recorded. Stop it first with android_stop_recording.`);
+		}
+		const devicePath = `/sdcard/android-mcp-recording-${Date.now()}.mp4`;
+		const args = ["shell", "screenrecord"];
+		const maxSize = options.maxSize ?? DEFAULT_RECORDING_MAX_SIZE;
+		const size = adb.getScreenSize(id);
+		const scale = Math.min(1, maxSize / Math.max(size.width, size.height));
+		const width = Math.max(2, Math.floor(size.width * scale / 2) * 2);
+		const height = Math.max(2, Math.floor(size.height * scale / 2) * 2);
+		args.push("--size", `${width}x${height}`);
+		args.push("--bit-rate", `${options.bitRate ?? DEFAULT_RECORDING_BIT_RATE}`);
+		args.push("--time-limit", `${options.timeLimit ?? DEFAULT_RECORDING_TIME_LIMIT_SECONDS}`);
+		args.push(devicePath);
+
+		const recording: ActiveRecording = { process: adb.spawnAdb(id, ...args), devicePath, startedAt: Date.now() };
+		activeRecordings.set(id, recording);
+		const forgetRecordingOnStartFailure = () => {
+			if (activeRecordings.get(id) === recording) activeRecordings.delete(id);
+		};
+		// Keep the entry after a time-limit exit: android_stop_recording still
+		// needs the device path to pull the finalized video.
+		recording.process.once("error", forgetRecordingOnStartFailure);
+		return recording;
+	};
+	const waitForRecordingToFinish = async (recording: ActiveRecording): Promise<void> => {
+		await new Promise<void>(resolve => {
+			const timer = setTimeout(() => {
+				recording.process.kill("SIGKILL");
+				resolve();
+			}, 10000);
+			if (recording.process.exitCode !== null) {
+				clearTimeout(timer);
+				resolve();
+				return;
+			}
+			recording.process.once("close", () => {
+				clearTimeout(timer);
+				resolve();
+			});
+		});
+	};
+	const stopRecording = async (id: string, saveTo?: string): Promise<{ outputPath: string; durationSeconds: number; sizeMB: string }> => {
+		const recording = activeRecordings.get(id);
+		if (!recording) throw new ActionableError(`No active recording for device "${id}". Start one with android_start_recording.`);
+		activeRecordings.delete(id);
+		const outputPath = saveTo ?? path.join(os.tmpdir(), `android-recording-${Date.now()}.mp4`);
+		if (saveTo) {
+			validateFileExtension(saveTo, ALLOWED_RECORDING_EXTENSIONS);
+			validateOutputPath(saveTo);
+		}
+		try { adb.shell(id, "killall", "-2", "screenrecord"); } catch { /* already stopped */ }
+		await waitForRecordingToFinish(recording);
+		await new Promise(resolve => setTimeout(resolve, 1000));
+		try {
+			adb.adb(id, "pull", recording.devicePath, outputPath);
+		} catch (error: any) {
+			throw new ActionableError(`Failed to pull recording from device: ${error.message}. The file may still be at ${recording.devicePath} on the device.`);
+		}
+		try { adb.shell(id, "rm", recording.devicePath); } catch { /* non-fatal */ }
+		return {
+			outputPath,
+			durationSeconds: Math.round((Date.now() - recording.startedAt) / 1000),
+			sizeMB: (fs.statSync(outputPath).size / (1024 * 1024)).toFixed(2),
+		};
+	};
+	const discardRecording = async (id: string): Promise<void> => {
+		const recording = activeRecordings.get(id);
+		if (!recording) return;
+		activeRecordings.delete(id);
+		try { adb.shell(id, "killall", "-2", "screenrecord"); } catch { /* already stopped */ }
+		await waitForRecordingToFinish(recording);
+		try { adb.shell(id, "rm", recording.devicePath); } catch { /* non-fatal */ }
+	};
+	const interpolate = (value: string, variables: Record<string, string>): string =>
+		value.replace(/\{\{([a-zA-Z_][a-zA-Z0-9_]*)\}\}/g, (_, name: string) => {
+			if (!(name in variables)) throw new ActionableError(`Sequence variable "${name}" is not defined.`);
+			return variables[name];
+		});
+	const interpolateSelector = (selector: ElementSelector, variables: Record<string, string>): ElementSelector =>
+		Object.fromEntries(Object.entries(selector).map(([key, value]) => [key, typeof value === "string" ? interpolate(value, variables) : value]));
 	const step = z.discriminatedUnion("action", [
 		z.object({ action: z.literal("tap"), x: coordinate, y: coordinate }),
 		z.object({ action: z.literal("swipe"), fromX: coordinate, fromY: coordinate, toX: coordinate, toY: coordinate, durationMs: z.number().int().min(1).max(10000) }),
 		z.object({ action: z.literal("key"), key: z.enum(["BACK", "HOME", "ENTER", "TAB"]) }),
 		z.object({ action: z.literal("wait"), durationMs: z.number().int().min(0).max(30000) }),
 		z.object({ action: z.literal("text"), text: z.string().max(1000), clear: z.boolean().optional(), submit: z.boolean().optional() }),
-		z.object({ action: z.literal("wait_for_element"), text: z.string().min(1).optional(), contentDesc: z.string().min(1).optional(), resourceId: z.string().min(1).optional(), timeoutMs: z.number().int().min(1).max(30000).optional() }),
+		z.object({ action: z.literal("wait_for_element"), ...selectorParams, timeoutMs: z.number().int().min(1).max(30000).optional() }),
+		z.object({ action: z.literal("assert_element"), ...selectorParams, timeoutMs: z.number().int().min(0).max(30000).optional() }),
+		z.object({ action: z.literal("assert_no_element"), ...selectorParams, timeoutMs: z.number().int().min(0).max(30000).optional() }),
+		z.object({ action: z.literal("assert_app"), packageName: z.string().min(1), activity: z.string().min(1).optional(), timeoutMs: z.number().int().min(0).max(30000).optional() }),
 	]);
+	type StoredFlow = { name: string; steps: unknown[]; variables?: Record<string, string>; savedAt: string };
+	const flowFilePath = process.env.ANDROID_MCP_FLOWS_PATH ?? path.join(os.homedir(), ".android-mcp", "flows.json");
+	const readFlows = (): StoredFlow[] => {
+		try {
+			const parsed: unknown = JSON.parse(fs.readFileSync(flowFilePath, "utf8"));
+			if (!Array.isArray(parsed)) throw new Error("expected an array");
+			return parsed as StoredFlow[];
+		} catch (error: any) {
+			if (error.code === "ENOENT") return [];
+			throw new ActionableError(`Unable to read saved flows: ${error.message}`);
+		}
+	};
+	const writeFlows = (flows: StoredFlow[]): void => {
+		const directory = path.dirname(flowFilePath);
+		fs.mkdirSync(directory, { recursive: true });
+		const temporaryPath = `${flowFilePath}.${process.pid}.tmp`;
+		fs.writeFileSync(temporaryPath, JSON.stringify(flows, null, 2), "utf8");
+		fs.renameSync(temporaryPath, flowFilePath);
+	};
+	const validateFlowName = (name: string): void => {
+		if (!/^[a-zA-Z0-9_-]{1,64}$/.test(name)) {
+			throw new ActionableError("Flow name must be 1-64 characters of letters, numbers, underscores, or hyphens.");
+		}
+	};
 
-	tool("run_sequence", "Run Android Sequence", "Run ordered Android actions, batching consecutive input commands in one ADB shell. Stops on errors; wait_for_element checks accessibility UI, not application success.",
-		{ device: deviceParam, steps: z.array(step).min(1).max(100) }, {}, async ({ device, steps }) => {
+	const runSequence = async (
+		device: string | undefined,
+		variables: Record<string, string> | undefined,
+		steps: any[],
+		record?: RecordingOptions & { mode: "always" | "on_failure" }
+	): Promise<string> => {
+			const sequenceVariables = variables ?? {};
 			for (const s of steps) {
-				if (s.action === "wait_for_element" && !s.text && !s.contentDesc && !s.resourceId) throw new Error("A selector is required for wait_for_element");
-				if (s.action === "text" && !adb.isAscii(s.text)) throw new Error("Only ASCII text is supported");
+				if ((s.action === "wait_for_element" || s.action === "assert_element" || s.action === "assert_no_element") && !ui.hasAnySelector(s)) throw new Error(`A selector is required for ${s.action}`);
+				if (s.action === "assert_app") validatePackageName(interpolate(s.packageName, sequenceVariables));
 			}
 			const id = adb.resolveDevice(device);
+			if (record) startRecording(id, record);
+			try {
 			let commands: string[] = [];
 			let batchStart = 0;
 			const flush = () => {
@@ -178,7 +384,7 @@ export const createServer = (): McpServer => {
 						if (s.action === "wait") await new Promise(resolve => setTimeout(resolve, s.durationMs));
 						else {
 							if (s.clear) clearField(id);
-							if (s.text) adb.shell(id, "input", "text", adb.escapeShellText(s.text));
+							if (s.text) typeText(id, interpolate(s.text, sequenceVariables));
 							if (s.submit) adb.shell(id, "input", "keyevent", "KEYCODE_ENTER");
 						}
 					} catch (error: any) { throw new Error(`Sequence failed at step ${i + 1}: ${error.message}`); }
@@ -186,8 +392,31 @@ export const createServer = (): McpServer => {
 				}
 				if (s.action === "wait_for_element") {
 					flush();
-					const found = await ui.waitForElement(id, { text: s.text, contentDesc: s.contentDesc, resourceId: s.resourceId }, s.timeoutMs ?? 10000);
+					const { action, timeoutMs, ...selector } = s;
+					const found = await ui.waitForElement(id, interpolateSelector(selector, sequenceVariables), timeoutMs ?? 10000);
 					if (!found) throw new Error(`Sequence failed at step ${i + 1}: element not found`);
+					continue;
+				}
+				if (s.action === "assert_element" || s.action === "assert_no_element") {
+					flush();
+					const { action, timeoutMs, ...selector } = s;
+					const timeout = timeoutMs ?? 0;
+					const resolvedSelector = interpolateSelector(selector, sequenceVariables);
+					const passed = action === "assert_element"
+						? Boolean(await ui.waitForElement(id, resolvedSelector, timeout))
+						: await ui.waitForNoElement(id, resolvedSelector, timeout);
+					if (!passed) throw new Error(`Sequence assertion failed at step ${i + 1}: ${action} ${ui.describeSelector(selector)}`);
+					continue;
+				}
+				if (s.action === "assert_app") {
+					flush();
+					const packageName = interpolate(s.packageName, sequenceVariables);
+					const activity = s.activity === undefined ? undefined : interpolate(s.activity, sequenceVariables);
+					const passed = await waitForForegroundApp(id, packageName, activity, s.timeoutMs ?? 0);
+					if (!passed) {
+						const current = adb.getCurrentApp(id);
+						throw new Error(`Sequence assertion failed at step ${i + 1}: expected foreground app ${packageName}${activity ? `/${activity}` : ""}, got ${current.packageName}/${current.activity}`);
+					}
 					continue;
 				}
 				if (!commands.length) batchStart = i;
@@ -196,8 +425,113 @@ export const createServer = (): McpServer => {
 				else if (s.action === "key") commands.push(`input keyevent KEYCODE_${s.key}`);
 			}
 			flush();
-			return JSON.stringify({ device: id, completed: steps.length });
-		});
+			const result: Record<string, unknown> = { device: id, completed: steps.length };
+			if (record?.mode === "always") {
+				result.recording = await stopRecording(id);
+			} else if (record?.mode === "on_failure") {
+				await discardRecording(id);
+			}
+			return JSON.stringify(result);
+			} catch (error: any) {
+				const artifacts = saveFailureArtifacts(id);
+				if (record && activeRecordings.has(id)) {
+					try {
+						artifacts.recording = (await stopRecording(id)).outputPath;
+					} catch (recordingError: any) {
+						artifacts.recordingError = recordingError.message;
+					}
+				}
+				throw new Error(`${error.message} Failure artifacts: ${JSON.stringify(artifacts)}`);
+			}
+	};
+
+	const recordingParams = {
+		mode: z.enum(["always", "on_failure"]).describe("always keeps a video for every run; on_failure keeps it only when the sequence fails."),
+		timeLimit: z.coerce.number().int().min(1).max(MAX_RECORDING_SECONDS).optional().describe(`Auto-stop after this many seconds. Defaults to ${DEFAULT_RECORDING_TIME_LIMIT_SECONDS}.`),
+		maxSize: z.number().int().min(16).max(4096).optional().describe(`Maximum video dimension. Defaults to ${DEFAULT_RECORDING_MAX_SIZE}px.`),
+		bitRate: z.number().int().min(100_000).max(100_000_000).optional().describe(`Video bitrate in bits per second. Defaults to ${DEFAULT_RECORDING_BIT_RATE}.`),
+	};
+
+	tool("run_sequence", "Run Android Sequence", "Run ordered Android actions, batching consecutive input commands in one ADB shell. Optionally capture lightweight 480p evidence; failed runs save video, screenshot, UI XML, and logcat.",
+		{ device: deviceParam, variables: z.record(z.string()).optional().describe("Reusable string values referenced as {{name}} in text, selectors, and assert_app."), steps: z.array(step).min(1).max(100), record: z.object(recordingParams).optional() }, {},
+		async ({ device, variables, steps, record }) => runSequence(device, variables, steps, record)
+	);
+
+	tool(
+		"android_save_flow",
+		"Save Flow",
+		"Persist a named Android sequence. Saving the same name replaces its previous definition.",
+		{ name: z.string(), steps: z.array(step).min(1).max(100), variables: z.record(z.string()).optional().describe("Default values, which callers can override when running the flow.") },
+		{},
+		async ({ name, steps, variables }) => {
+			validateFlowName(name);
+			const flows = readFlows().filter(flow => flow.name !== name);
+			flows.push({ name, steps, variables, savedAt: new Date().toISOString() });
+			writeFlows(flows);
+			return `Saved flow "${name}" with ${steps.length} steps.`;
+		}
+	);
+
+	tool(
+		"android_list_flows",
+		"List Saved Flows",
+		"List persistent named sequences available to run.",
+		{},
+		{ readOnlyHint: true },
+		async () => JSON.stringify({ flows: readFlows().map(({ name, savedAt, steps, variables }) => ({ name, savedAt, steps: steps.length, variables: Object.keys(variables ?? {}) })) }, null, 2)
+	);
+
+	tool(
+		"android_run_flow",
+		"Run Saved Flow",
+		"Run a previously saved named sequence, optionally overriding its default variables.",
+		{ device: deviceParam, name: z.string(), variables: z.record(z.string()).optional(), record: z.object(recordingParams).optional() },
+		{},
+		async ({ device, name, variables, record }) => {
+			validateFlowName(name);
+			const flow = readFlows().find(candidate => candidate.name === name);
+			if (!flow) throw new ActionableError(`Saved flow "${name}" was not found. Use android_list_flows to see available flows.`);
+			const parsedSteps = z.array(step).min(1).max(100).safeParse(flow.steps);
+			if (!parsedSteps.success) throw new ActionableError(`Saved flow "${name}" is invalid: ${parsedSteps.error.message}`);
+			return runSequence(device, { ...flow.variables, ...variables }, parsedSteps.data, record);
+		}
+	);
+
+	tool(
+		"android_delete_flow",
+		"Delete Saved Flow",
+		"Delete a named saved flow. Set confirm to true to execute.",
+		{ name: z.string(), confirm: z.literal(true).optional() },
+		{ destructiveHint: true },
+		async ({ name, confirm }) => {
+			validateFlowName(name);
+			if (!confirm) return `Dry run: set confirm: true to delete saved flow "${name}".`;
+			const flows = readFlows();
+			if (!flows.some(flow => flow.name === name)) throw new ActionableError(`Saved flow "${name}" was not found.`);
+			writeFlows(flows.filter(flow => flow.name !== name));
+			return `Deleted saved flow "${name}".`;
+		}
+	);
+
+	tool(
+		"android_clear_saved_data",
+		"Clear Saved MCP Data",
+		"Permanently delete every saved flow and its default variables from this MCP's flow store. Set confirm to true to execute.",
+		{ confirm: z.literal(true).optional() },
+		{ destructiveHint: true },
+		async ({ confirm }) => {
+			const flowCount = readFlows().length;
+			const recordingCount = activeRecordings.size;
+			if (!confirm) return `Dry run: set confirm: true to permanently delete ${flowCount} saved flow(s), stop ${recordingCount} active recording(s), and clear temporary MCP artifacts.`;
+			try {
+				fs.rmSync(flowFilePath, { force: true });
+				cleanRuntimeState();
+			} catch (error: any) {
+				throw new ActionableError(`Unable to clear saved data: ${error.message}`);
+			}
+			return `Cleared ${flowCount} saved flow(s), stopped ${recordingCount} active recording(s), and removed temporary MCP artifacts.`;
+		}
+	);
 
 	// ------------------------------------------------------------------
 	// Device management
@@ -353,6 +687,45 @@ export const createServer = (): McpServer => {
 	);
 
 	tool(
+		"android_install_split_apps",
+		"Install Split APKs",
+		"Install a base APK and its split APK files with adb install-multiple.",
+		{
+			device: deviceParam,
+			apkPaths: z.array(z.string()).min(2).describe("Absolute paths to the base APK and every split APK"),
+			grantPermissions: z.boolean().optional(),
+		},
+		{},
+		async ({ device, apkPaths, grantPermissions }) => {
+			const missing = apkPaths.find((apkPath: string) => !fs.existsSync(apkPath));
+			if (missing) throw new ActionableError(`APK file not found at "${missing}"`);
+			if (apkPaths.some((apkPath: string) => path.extname(apkPath).toLowerCase() !== ".apk")) {
+				throw new ActionableError("android_install_split_apps accepts extracted .apk files. Extract .apks or .xapk archives first.");
+			}
+			const id = adb.resolveDevice(device);
+			const args = ["install-multiple", "-r"];
+			if (grantPermissions) args.push("-g");
+			adb.adb(id, ...args, ...apkPaths);
+			return `Installed ${apkPaths.length} split APK files`;
+		}
+	);
+
+	tool(
+		"android_clear_app_data",
+		"Clear App Data",
+		"Reset an app to its initial state by deleting its local data. Set confirm to true to execute; otherwise this is a dry run.",
+		{ device: deviceParam, packageName: z.string(), confirm: z.literal(true).optional() },
+		{ destructiveHint: true },
+		async ({ device, packageName, confirm }) => {
+			validatePackageName(packageName);
+			if (!confirm) return `Dry run: set confirm: true to clear data for ${packageName}.`;
+			const id = adb.resolveDevice(device);
+			adb.shell(id, "pm", "clear", packageName);
+			return `Cleared app data for ${packageName}`;
+		}
+	);
+
+	tool(
 		"android_uninstall_app",
 		"Uninstall App",
 		"Uninstall an app from the device by package name.",
@@ -435,6 +808,8 @@ export const createServer = (): McpServer => {
 				identifier: el.identifier,
 				focused: el.focused,
 				clickable: el.clickable,
+				enabled: el.enabled,
+				checked: el.checked,
 				coordinates: {
 					x: el.rect.x + Math.floor(el.rect.width / 2),
 					y: el.rect.y + Math.floor(el.rect.height / 2),
@@ -442,6 +817,23 @@ export const createServer = (): McpServer => {
 				rect: el.rect,
 			}));
 			return JSON.stringify({ elements }, null, 2);
+		}
+	);
+
+	tool(
+		"android_capture_state",
+		"Capture Device State",
+		"Capture a diagnostic snapshot: screenshot, accessible UI elements, foreground app, and recent logcat.",
+		{ device: deviceParam, saveTo: z.string().optional().describe("Existing absolute directory for the screenshot") },
+		{ readOnlyHint: true },
+		async ({ device, saveTo }) => {
+			const id = adb.resolveDevice(device);
+			if (saveTo && (!path.isAbsolute(saveTo) || !fs.existsSync(saveTo) || !fs.statSync(saveTo).isDirectory())) {
+				throw new ActionableError("saveTo must be an existing absolute directory.");
+			}
+			const screenshotPath = path.join(saveTo ?? transientDirectory, `android-state-${Date.now()}.png`);
+			fs.writeFileSync(screenshotPath, adb.adb(id, "exec-out", "screencap", "-p"));
+			return JSON.stringify({ device: id, screenshotPath, foregroundApp: adb.getCurrentApp(id), elements: ui.getElements(id), logcat: adb.adb(id, "logcat", "-d", "-t", "100").toString() }, null, 2);
 		}
 	);
 
@@ -499,9 +891,11 @@ export const createServer = (): McpServer => {
 			...selectorParams,
 			index: z.coerce.number().min(0).optional().describe("Which match to tap when multiple elements match (0-based). Defaults to 0."),
 			timeout: z.coerce.number().min(1).max(60).optional().describe("Max seconds to wait for the element. Defaults to 5."),
+			retries: z.coerce.number().int().min(0).max(3).optional().describe("Extra attempts if the tap command fails. Defaults to 0."),
+			retryDelayMs: z.coerce.number().int().min(0).max(5000).optional().describe("Delay between retry attempts. Defaults to 250 ms."),
 		},
 		{},
-		async ({ device, index, timeout, ...selector }) => {
+		async ({ device, index, timeout, retries, retryDelayMs, ...selector }) => {
 			const id = adb.resolveDevice(device);
 			requireSelector(selector);
 			const wantedIndex = index ?? 0;
@@ -511,9 +905,20 @@ export const createServer = (): McpServer => {
 					`Element not found within ${timeout ?? 5}s for selector ${ui.describeSelector(selector)} (index ${wantedIndex}). Check the screen with android_list_elements.`
 				);
 			}
-			const center = elementCenter(found);
-			adb.shell(id, "input", "tap", `${center.x}`, `${center.y}`);
-			return `Tapped element ${ui.describeSelector(selector)} at (${center.x}, ${center.y})`;
+			const attempts = (retries ?? 0) + 1;
+			for (let attempt = 1; attempt <= attempts; attempt++) {
+				try {
+					const current = attempt === 1 ? found : await ui.waitForElement(id, selector, (timeout ?? 5) * 1000, wantedIndex);
+					if (!current) throw new ActionableError("Element disappeared before it could be tapped.");
+					const center = elementCenter(current);
+					adb.shell(id, "input", "tap", `${center.x}`, `${center.y}`);
+					return `Tapped element ${ui.describeSelector(selector)} at (${center.x}, ${center.y}) on attempt ${attempt}`;
+				} catch (error) {
+					if (attempt === attempts) throw error;
+					await new Promise(resolve => setTimeout(resolve, retryDelayMs ?? 250));
+				}
+			}
+			throw new ActionableError("Tap failed.");
 		}
 	);
 
@@ -630,28 +1035,22 @@ export const createServer = (): McpServer => {
 	tool(
 		"android_type_text",
 		"Type Text",
-		"Type text into the currently focused input field. Tap the field first. ASCII only (adb limitation).",
+		"Type text into the currently focused input field. Tap the field first. Non-ASCII text is pasted through the Android clipboard when supported by the device.",
 		{
 			device: deviceParam,
-			text: z.string().describe("The text to type (ASCII only)"),
+			text: z.string().describe("The text to type"),
 			submit: z.boolean().optional().describe("Press ENTER after typing"),
 			clear: z.boolean().optional().describe("Clear the field before typing (select-all + delete)"),
 		},
 		{},
 		async ({ device, text, submit, clear }) => {
 			const id = adb.resolveDevice(device);
-			if (!adb.isAscii(text)) {
-				throw new ActionableError(
-					"Non-ASCII text is not supported by 'adb shell input text'. Type the ASCII part or use the device keyboard."
-				);
-			}
-
 			if (clear) {
 				clearField(id);
 			}
 
 			if (text !== "") {
-				adb.shell(id, "input", "text", adb.escapeShellText(text));
+				typeText(id, text);
 			}
 			if (submit) {
 				adb.shell(id, "input", "keyevent", "KEYCODE_ENTER");
@@ -745,40 +1144,18 @@ export const createServer = (): McpServer => {
 	tool(
 		"android_start_recording",
 		"Start Screen Recording",
-		"Start recording the device screen in the background. Stop it with android_stop_recording. Max duration is 180 seconds (Android limit).",
+		"Start a lightweight 480p screen recording in the background. Stop it with android_stop_recording. Max duration is 180 seconds (Android limit).",
 		{
 			device: deviceParam,
-			timeLimit: z.coerce.number().min(1).max(MAX_RECORDING_SECONDS).optional().describe("Auto-stop after this many seconds. Defaults to 180 (maximum)."),
-			maxSize: z.number().int().min(16).max(4096).optional().describe("Maximum video dimension in pixels, e.g. 480."),
+			timeLimit: recordingParams.timeLimit,
+			maxSize: recordingParams.maxSize,
+			bitRate: recordingParams.bitRate,
 		},
 		{},
-		async ({ device, timeLimit, maxSize }) => {
+		async ({ device, timeLimit, maxSize, bitRate }) => {
 			const id = adb.resolveDevice(device);
-			if (activeRecordings.has(id)) {
-				throw new ActionableError(
-					`Device "${id}" is already being recorded. Stop it first with android_stop_recording.`
-				);
-			}
-
-			const devicePath = `/sdcard/android-mcp-recording-${Date.now()}.mp4`;
-			const args = ["shell", "screenrecord"];
-			if (maxSize) {
-				const size = adb.getScreenSize(id);
-				const scale = Math.min(1, maxSize / Math.max(size.width, size.height));
-				const width = Math.max(2, Math.floor(size.width * scale / 2) * 2);
-				const height = Math.max(2, Math.floor(size.height * scale / 2) * 2);
-				args.push("--size", `${width}x${height}`);
-			}
-			args.push("--time-limit", `${timeLimit ?? MAX_RECORDING_SECONDS}`);
-			args.push(devicePath);
-
-			const child = adb.spawnAdb(id, ...args);
-			const recording: ActiveRecording = { process: child, devicePath, startedAt: Date.now() };
-			activeRecordings.set(id, recording);
-
-			child.on("error", () => activeRecordings.delete(id));
-
-			return `Screen recording started on ${id}. Use android_stop_recording to stop and save it.`;
+			startRecording(id, { timeLimit, maxSize, bitRate });
+			return `Screen recording started on ${id} (${maxSize ?? DEFAULT_RECORDING_MAX_SIZE}px max, ${bitRate ?? DEFAULT_RECORDING_BIT_RATE} bps). Use android_stop_recording to stop and save it.`;
 		}
 	);
 
@@ -793,62 +1170,8 @@ export const createServer = (): McpServer => {
 		{},
 		async ({ device, saveTo }) => {
 			const id = adb.resolveDevice(device);
-			const recording = activeRecordings.get(id);
-			if (!recording) {
-				throw new ActionableError(
-					`No active recording for device "${id}". Start one with android_start_recording.`
-				);
-			}
-			activeRecordings.delete(id);
-
-			const outputPath = saveTo ?? path.join(os.tmpdir(), `android-recording-${Date.now()}.mp4`);
-			if (saveTo) {
-				validateFileExtension(saveTo, ALLOWED_RECORDING_EXTENSIONS);
-				validateOutputPath(saveTo);
-			}
-
-			// ask screenrecord on the device to finalize the file gracefully
-			try {
-				adb.shell(id, "killall", "-2", "screenrecord");
-			} catch {
-				// already exited (e.g. time limit reached)
-			}
-
-			await new Promise<void>(resolve => {
-				const timer = setTimeout(() => {
-					recording.process.kill("SIGKILL");
-					resolve();
-				}, 10000);
-				if (recording.process.exitCode !== null) {
-					clearTimeout(timer);
-					resolve();
-					return;
-				}
-				recording.process.on("close", () => {
-					clearTimeout(timer);
-					resolve();
-				});
-			});
-
-			// give the device a moment to flush the mp4 moov atom
-			await new Promise(resolve => setTimeout(resolve, 1000));
-
-			try {
-				adb.adb(id, "pull", recording.devicePath, outputPath);
-			} catch (error: any) {
-				throw new ActionableError(
-					`Failed to pull recording from device: ${error.message}. The file may still be at ${recording.devicePath} on the device.`
-				);
-			}
-			try {
-				adb.shell(id, "rm", recording.devicePath);
-			} catch {
-				// non-fatal
-			}
-
-			const durationSeconds = Math.round((Date.now() - recording.startedAt) / 1000);
-			const sizeMB = (fs.statSync(outputPath).size / (1024 * 1024)).toFixed(2);
-			return `Recording saved to ${outputPath} (${sizeMB} MB, ~${durationSeconds}s)`;
+			const recording = await stopRecording(id, saveTo);
+			return `Recording saved to ${recording.outputPath} (${recording.sizeMB} MB, ~${recording.durationSeconds}s)`;
 		}
 	);
 

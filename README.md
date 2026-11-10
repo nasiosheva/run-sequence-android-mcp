@@ -1,6 +1,6 @@
 # run-sequence-android-mcp
 
-Maintained by [Nasio Sheva](https://github.com/nasiosheva). This project is a fork of [android-mcp](https://github.com/qalvinahmad/android-mcp) by Alvin Ahmad, with a `run_sequence` tool. Existing Android tools remain available.
+Maintained by [Nasio Sheva](https://github.com/nasiosheva). This project is a fork of android-mcp with a `run_sequence` tool. Existing Android tools remain available.
 Build with `npm ci && npm run build`, then configure an MCP stdio client to run
 `node /absolute/path/to/run-sequence-android-mcp/dist/index.js`.
 
@@ -232,4 +232,4 @@ Issues and pull requests are welcome. Keep changes small and focused:
 
 ## License
 
-[MIT](LICENSE). Original project copyright © Alvin Ahmad ([@qalvinahmad](https://github.com/qalvinahmad)); this fork is maintained by Nasio Sheva ([@nasiosheva](https://github.com/nasiosheva)).
+[MIT](LICENSE). This fork is maintained by Nasio Sheva ([@nasiosheva](https://github.com/nasiosheva)); the original copyright notice is retained in the license.

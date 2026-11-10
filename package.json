@@ -27,16 +27,16 @@
     "automation",
     "modelcontextprotocol"
   ],
-  "author": "Alvin Ahmad (https://github.com/qalvinahmad)",
+  "author": "Nasio Sheva (https://github.com/nasiosheva)",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/qalvinahmad/android-mcp.git"
+    "url": "git+https://github.com/nasiosheva/run-sequence-android-mcp.git"
   },
   "bugs": {
-    "url": "https://github.com/qalvinahmad/android-mcp/issues"
+    "url": "https://github.com/nasiosheva/run-sequence-android-mcp/issues"
   },
-  "homepage": "https://github.com/qalvinahmad/android-mcp#readme",
+  "homepage": "https://github.com/nasiosheva/run-sequence-android-mcp#readme",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
     "fast-xml-parser": "^5.2.0",

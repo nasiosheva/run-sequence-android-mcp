@@ -135,8 +135,15 @@ export const createServer = (): McpServer => {
 
 	const coordinate = z.number().int().min(0).max(32767);
 	const clearField = (id: string): void => {
-		adb.shell(id, "input", "keycombination", "CTRL_LEFT", "A");
-		adb.shell(id, "input", "keyevent", "KEYCODE_DEL");
+		const field = ui.getElements(id).find(el => el.focused && el.type === "android.widget.EditText");
+		if (!field) throw new ActionableError("Cannot clear: no accessible focused text field found.");
+		const value = field.text === field.label ? "" : (field.text ?? "");
+		if (value.length > 1000) throw new ActionableError("Cannot clear a field longer than 1000 characters.");
+		if (value.length) {
+			adb.shell(id, "input", "keyevent", "KEYCODE_MOVE_END", ...Array.from({ length: value.length }, () => "KEYCODE_DEL"));
+		}
+		const remaining = ui.getElements(id).find(el => el.focused && el.type === "android.widget.EditText");
+		if (remaining?.text && remaining.text !== remaining.label) throw new ActionableError("Could not verify that the focused field is empty.");
 	};
 	const step = z.discriminatedUnion("action", [
 		z.object({ action: z.literal("tap"), x: coordinate, y: coordinate }),

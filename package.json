@@ -1,0 +1,49 @@
+{
+  "name": "run-sequence-android-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for Android device automation over ADB — screenshots, UI hierarchy, taps, swipes, app management, logcat, and screen recording",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "android-mcp": "dist/index.js",
+    "run-sequence-android-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch",
+    "start": "node dist/index.js",
+    "inspector": "npx @modelcontextprotocol/inspector node dist/index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "mcp",
+    "android",
+    "adb",
+    "automation",
+    "modelcontextprotocol"
+  ],
+  "author": "Alvin Ahmad (https://github.com/qalvinahmad)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/qalvinahmad/android-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/qalvinahmad/android-mcp/issues"
+  },
+  "homepage": "https://github.com/qalvinahmad/android-mcp#readme",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "fast-xml-parser": "^5.2.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "typescript": "^5.8.0"
+  }
+}
